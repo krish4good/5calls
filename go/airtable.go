@@ -6,7 +6,11 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
+	"net/url"
 )
+
+var issuesTable = "Issues%20list"
+var contactsTable= "Contact"
 
 func refreshIssuesAndContacts() {
 	globalIssues, _ = fetchIssues()
@@ -80,7 +84,8 @@ func (i AirtableIssues) exportIssues() []Issue {
 }
 
 func fetchIssues() (AirtableIssues, error) {
-	url := "https://api.airtable.com/v0/app6dzsa26hDjI7tp/Issues%20list?filterByFormula=NOT(%7BInactive%7D)"
+	formula := url.QueryEscape("NOT({Inactive})")
+	url := fmt.Sprintf("%s/%s?filterByFormula=%s", *airtableUrl, issuesTable, formula)
 
 	client := http.DefaultClient
 	req, e := http.NewRequest("GET", url, nil)
@@ -114,7 +119,7 @@ type AirtableContact struct {
 }
 
 func fetchContacts() (AirtableContacts, error) {
-	url := "https://api.airtable.com/v0/app6dzsa26hDjI7tp/Contact"
+	url := fmt.Sprintf("%s/%s", *airtableUrl, contactsTable)
 
 	client := http.DefaultClient
 	req, e := http.NewRequest("GET", url, nil)

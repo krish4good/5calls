@@ -20,6 +20,7 @@ import (
 var (
 	addr         = flag.String("addr", ":8090", "[ip]:port to listen on")
 	dbfile       = flag.String("dbfile", "fivecalls.db", "filename for sqlite db")
+	airtableUrl  = flag.String("db-url", "https://api.airtable.com/v0/app6dzsa26hDjI7tp", "base URL for airtable database")
 	airtableKey  = os.Getenv("AIRTABLE_API_KEY")
 	civicKey     = os.Getenv("CIVIC_API_KEY")
 	civicCache   = cache.New(1*time.Hour, 10*time.Minute)
@@ -156,7 +157,7 @@ func pageHandler(w http.ResponseWriter, r *http.Request) {
 					contact.Fields.Reason = "This is your local representative in the House"
 				}
 
-				newContacts = append(newContacts, contact)				
+				newContacts = append(newContacts, contact)
 			}
 		}
 
