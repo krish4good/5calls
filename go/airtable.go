@@ -3,136 +3,207 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"log"
-	"net/http"
-	"net/url"
+	"sync/atomic"
+
+	"github.com/fabioberger/airtable-go"
+	"time"
 )
 
-var issuesTable = "Issues%20list"
-var contactsTable= "Contact"
+const (
+	issuesTable   = "Issues list"
+	contactsTable = "Contact"
+)
 
-func refreshIssuesAndContacts() {
-	globalIssues, _ = fetchIssues()
-	log.Printf("issues %v", globalIssues)
-	contacts, _ := fetchContacts()
-	log.Printf("contacts %v", contacts)
+var minRefreshInterval = time.Minute
 
-	// remove empty ones from airtable
-	for index, issue := range globalIssues.Records {
-		if issue.Fields.Name == "" {
-			globalIssues.Records = append(globalIssues.Records[:index], globalIssues.Records[index+1:]...)
-		}
+// IssueLister is something that can produce a list of all issues.
+type IssueLister interface {
+	AllIssues() ([]Issue, error)
+}
+
+func asJson(data interface{}) string {
+	b, err := json.Marshal(data)
+	if err != nil {
+		return fmt.Sprint(data)
 	}
+	return string(b)
+}
 
-	// add contacts to the right spot
-	for index, issue := range globalIssues.Records {
-		if issue.Contacts == nil {
-			issue.Contacts = []AirtableContact{}
-		}
+// atIssueInfo is the record definition of an issue, minus its key
+type atIssueInfo struct {
+	Name         string   `json:"Name"`
+	Action       string   `json:"Action requested"`
+	Script       string   `json:"Script"`
+	ContactLinks []string `json:"contact"`
+}
 
-		for _, contactID := range issue.Fields.ContactIDs {
-			for _, contact := range contacts.Records {
-				if contactID == contact.ID {
-					globalIssues.Records[index].Contacts = append(globalIssues.Records[index].Contacts, contact)
-				}
+// atIssue is an airtable issue record.
+type atIssue struct {
+	ID          string `json:"id"`
+	atIssueInfo `json:"fields"`
+	Contacts    []*atContact `json:"contacts"`
+}
+
+func (i *atIssue) String() string { return asJson(i) }
+
+func (i *atIssue) toIssue(contacts []Contact) Issue {
+	return Issue{
+		ID:       i.ID,
+		Name:     i.Name,
+		Script:   i.Script,
+		Contacts: contacts,
+	}
+}
+
+// atContactInfo is the record definition of a contact minus its key.
+type atContactInfo struct {
+	Name     string `json:"Name"`
+	Phone    string `json:"Phone"`
+	PhotoURL string `json:"PhotoURL"`
+	Area     string `json:"Area"`
+	Reason   string `json:"Contact Reason"`
+}
+
+// atContact is an airtable contact record.
+type atContact struct {
+	ID            string `json:"id"`
+	atContactInfo `json:"fields"`
+}
+
+func (c *atContact) String() string { return asJson(c) }
+
+func (c *atContact) toContact() Contact {
+	return Contact{
+		Name:     c.Name,
+		Phone:    c.Phone,
+		PhotoURL: c.PhotoURL,
+		Reason:   c.Reason,
+		Area:     c.Area,
+	}
+}
+
+// AirtableConfig is the configuration for the airtable client.
+type AirtableConfig struct {
+	BaseID string // ID of the airtable base
+	APIKey string // API key for HTTP calls
+}
+
+// AirtableClient provides a semantic API to the backend database.
+type AirtableClient struct {
+	client *airtable.Client
+}
+
+func NewAirtableClient(config AirtableConfig) *AirtableClient {
+	c := airtable.New(config.APIKey, config.BaseID, true)
+	return &AirtableClient{client: c}
+}
+
+// AllIssues returns a list of issues with standard contacts, if any, linked to them.
+func (c *AirtableClient) AllIssues() ([]Issue, error) {
+	// load all contacts first
+	var cList []*atContact
+	err := c.client.ListRecords(contactsTable, &cList, airtable.ListParameters{
+		FilterByFormula: `NOT(NAME = "")`,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("unable to load contacts, %v", err)
+	}
+	// index contacts by ID for easy joins
+	contactsMap := map[string]*atContact{}
+	for _, c := range cList {
+		contactsMap[c.ID] = c
+	}
+	// load all issues
+	var list []*atIssue
+	err = c.client.ListRecords(issuesTable, &list, airtable.ListParameters{
+		FilterByFormula: `NOT(OR(NAME = "", INACTIVE))`,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("unable to load issues, %v", err)
+	}
+	// normalize and join with contacts
+	var ret []Issue
+	for _, i := range list {
+		var contacts []Contact
+		for _, id := range i.ContactLinks {
+			contact := contactsMap[id]
+			if contact == nil {
+				log.Println("[WARN] unable to find contact with ID", id)
+				continue
 			}
+			contacts = append(contacts, contact.toContact())
+		}
+		ret = append(ret, i.toIssue(contacts))
+	}
+	return ret, nil
+}
+
+// issueCache stores an in-memory copy of the issue list with automatic refresh.
+type issueCache struct {
+	delegate IssueLister
+	stop     chan struct{}
+	force    chan struct{}
+	val      atomic.Value
+}
+
+// NewIssueCache returns an issue cache after ensuring that the issue list is loaded.
+func NewIssueCache(delegate IssueLister, refreshInterval time.Duration) (IssueLister, error) {
+	issues, err := delegate.AllIssues()
+	if err != nil {
+		return nil, err
+	}
+	if refreshInterval <= minRefreshInterval {
+		refreshInterval = minRefreshInterval
+	}
+	ic := &issueCache{
+		delegate: delegate,
+		stop:     make(chan struct{}, 1),
+		force:    make(chan struct{}, 1),
+	}
+	ic.val.Store(issues)
+	go ic.refresh(refreshInterval)
+	return ic, nil
+}
+
+// Reload immediately reloads the database in the background.
+func (ic *issueCache) Reload() {
+	ic.force <- struct{}{}
+}
+
+func (ic *issueCache) Close() error {
+	close(ic.stop)
+	return nil
+}
+
+func (ic *issueCache) refresh(interval time.Duration) {
+	reload := func() {
+		issues, err := ic.delegate.AllIssues()
+		if err != nil {
+			log.Println("Error loading issues,", err)
+		}
+		log.Println(len(issues), "issues loaded")
+		ic.val.Store(issues)
+	}
+	t := time.NewTicker(interval)
+	defer func() {
+		t.Stop()
+	}()
+	for {
+		select {
+		case <-t.C:
+			reload()
+		case <-ic.force:
+			reload()
+			// reset the timer to start the refresh from now
+			t.Stop()
+			t = time.NewTicker(interval)
+		case <-ic.stop:
+			return
 		}
 	}
-
 }
 
-type AirtableIssues struct {
-	Records []struct {
-		ID     string `json:"id"`
-		Fields struct {
-			Name       string
-			Action     string `json:"Action requested"`
-			Script     string
-			ContactIDs []string `json:"Contact"`
-		}
-		Contacts []AirtableContact
-	} `json:"records"`
-}
-
-func (i AirtableIssues) exportIssues() []Issue {
-	issues := []Issue{}
-	// jsonData, _ := json.Marshal(i)
-	// log.Printf("airtable: %s", jsonData)
-
-	for _, airtableIssue := range i.Records {
-		newIssue := Issue{ID: airtableIssue.ID, Name: airtableIssue.Fields.Name, Reason: airtableIssue.Fields.Action, Script: airtableIssue.Fields.Script}
-
-		newContacts := []Contact{}
-		for _, airtableContact := range airtableIssue.Contacts {
-			newContact := Contact{
-				Name:     airtableContact.Fields.Name,
-				Phone:    airtableContact.Fields.Phone,
-				PhotoURL: airtableContact.Fields.PhotoURL,
-				Reason:   airtableContact.Fields.Reason,
-				Area:     airtableContact.Fields.Area,
-			}
-
-			newContacts = append(newContacts, newContact)
-		}
-		newIssue.Contacts = newContacts
-
-		issues = append(issues, newIssue)
-	}
-
-	return issues
-}
-
-func fetchIssues() (AirtableIssues, error) {
-	formula := url.QueryEscape("NOT({Inactive})")
-	url := fmt.Sprintf("%s/%s?filterByFormula=%s", *airtableUrl, issuesTable, formula)
-
-	client := http.DefaultClient
-	req, e := http.NewRequest("GET", url, nil)
-	req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", airtableKey))
-	resp, e := client.Do(req)
-	defer resp.Body.Close()
-
-	body, _ := ioutil.ReadAll(resp.Body)
-	parsedResponse := AirtableIssues{}
-	if resp.StatusCode >= 200 && resp.StatusCode <= 400 && e == nil {
-		json.Unmarshal(body, &parsedResponse)
-		return parsedResponse, nil
-	}
-
-	return parsedResponse, fmt.Errorf("issue error code:%d error:%v body:%s", resp.StatusCode, e, body)
-}
-
-type AirtableContacts struct {
-	Records []AirtableContact `json:"records"`
-}
-
-type AirtableContact struct {
-	ID     string
-	Fields struct {
-		Name     string
-		Phone    string
-		PhotoURL string
-		Area     string
-		Reason   string `json:"Contact Reason"`
-	}
-}
-
-func fetchContacts() (AirtableContacts, error) {
-	url := fmt.Sprintf("%s/%s", *airtableUrl, contactsTable)
-
-	client := http.DefaultClient
-	req, e := http.NewRequest("GET", url, nil)
-	req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", airtableKey))
-	resp, e := client.Do(req)
-	defer resp.Body.Close()
-
-	body, _ := ioutil.ReadAll(resp.Body)
-	parsedResponse := AirtableContacts{}
-	if resp.StatusCode >= 200 && resp.StatusCode <= 400 && e == nil {
-		json.Unmarshal(body, &parsedResponse)
-		return parsedResponse, nil
-	}
-
-	return parsedResponse, fmt.Errorf("contact error code:%d error:%v body:%s", resp.StatusCode, e, body)
+func (ic *issueCache) AllIssues() ([]Issue, error) {
+	return ic.val.Load().([]Issue), nil
 }

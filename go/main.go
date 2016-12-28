@@ -20,15 +20,17 @@ import (
 var (
 	addr         = flag.String("addr", ":8090", "[ip]:port to listen on")
 	dbfile       = flag.String("dbfile", "fivecalls.db", "filename for sqlite db")
-	airtableUrl  = flag.String("db-url", "https://api.airtable.com/v0/app6dzsa26hDjI7tp", "base URL for airtable database")
+	airtableBase = flag.String("airtable-base", "app6dzsa26hDjI7tp", "base ID for airtable store")
 	airtableKey  = os.Getenv("AIRTABLE_API_KEY")
 	civicKey     = os.Getenv("CIVIC_API_KEY")
 	civicCache   = cache.New(1*time.Hour, 10*time.Minute)
-	globalIssues = AirtableIssues{}
 
 	db         *sql.DB
 	countCache = cache.New(1*time.Hour, 10*time.Minute)
 )
+
+
+var globalIssues IssueLister
 
 var pagetemplate *template.Template
 
@@ -42,8 +44,16 @@ func main() {
 		log.Fatal("No google civic API key found")
 	}
 
-	// log.Printf("api keys %s %s", airtableKey, civicKey)
-	refreshIssuesAndContacts()
+	atClient := NewAirtableClient(AirtableConfig{
+		BaseID: *airtableBase,
+		APIKey: airtableKey,
+	})
+
+	var gErr error
+	globalIssues, gErr = NewIssueCache(atClient, 30*time.Minute)
+	if gErr != nil {
+		log.Fatalln(gErr)
+	}
 
 	// index template... unused
 	p, err := template.ParseFiles("index.html")
@@ -82,7 +92,7 @@ func pageHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	zip := vars["zip"]
 
-	localContacts := []AirtableContact{}
+	localContacts := []Contact{}
 
 	if len(zip) == 5 && zip != "" {
 		log.Printf("zip %s", zip)
@@ -115,33 +125,30 @@ func pageHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		for _, rep := range validOfficials {
-			contact := AirtableContact{Fields: struct {
-				Name     string
-				Phone    string
-				PhotoURL string
-				Area     string
-				Reason   string `json:"Contact Reason"`
-			}{
+			localContacts = append(localContacts, Contact{
 				Name:     rep.Name,
 				Phone:    rep.Phones[0],
 				PhotoURL: rep.PhotoURL,
 				Area:     rep.Area,
-			}}
-
-			localContacts = append(localContacts, contact)
+			})
 		}
 	} else {
 		log.Printf("no zip")
 	}
 
 	// add local reps where necessary
-	customizedIssues := AirtableIssues{}
-	for _, issue := range globalIssues.Records {
+	customizedIssues := []Issue{}
+	all, err := globalIssues.AllIssues()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	for _, issue := range all {
 		addContacts := false
-		newContacts := []AirtableContact{}
+		newContacts := []Contact{}
 
 		for _, contact := range issue.Contacts {
-			if contact.Fields.Name == "LOCAL REP" {
+			if contact.Name == "LOCAL REP" {
 				addContacts = true
 			} else {
 				newContacts = append(newContacts, contact)
@@ -151,10 +158,10 @@ func pageHandler(w http.ResponseWriter, r *http.Request) {
 		if addContacts {
 			// add the local contacts loaded from google civic
 			for _, contact := range localContacts {
-				if contact.Fields.Area == "Senate" {
-					contact.Fields.Reason = "This is one of your two Senators"
-				} else if contact.Fields.Area == "House" {
-					contact.Fields.Reason = "This is your local representative in the House"
+				if contact.Area == "Senate" {
+					contact.Reason = "This is one of your two Senators"
+				} else if contact.Area == "House" {
+					contact.Reason = "This is your local representative in the House"
 				}
 
 				newContacts = append(newContacts, contact)
@@ -162,15 +169,10 @@ func pageHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		issue.Contacts = newContacts
-		customizedIssues.Records = append(customizedIssues.Records, issue)
-	}
-
-	jsonData, err := json.Marshal(customizedIssues.exportIssues())
-	if err != nil {
-		panic(err)
+		customizedIssues = append(customizedIssues, issue)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Write(jsonData)
+	json.NewEncoder(w).Encode(customizedIssues)
 }
