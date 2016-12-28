@@ -4,18 +4,20 @@ import (
 	"net/http"
 )
 
-func adminHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "GET" {
-		http.Error(w, "GET only", 403)
-		return
-	}
-
+type cacheReloader interface {
+	Reload()
 }
 
-func adminRefreshHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, "POST only", 403)
-		return
-	}
+type adminHandler struct {
+	reloader cacheReloader
+}
 
+func (a *adminHandler) Stats(w http.ResponseWriter, r *http.Request) {
+	http.Error(w, "Not implemented", http.StatusNotImplemented)
+}
+
+func (a *adminHandler) ReloadCache(w http.ResponseWriter, r *http.Request) {
+	a.reloader.Reload()
+	w.Header().Set("Content-Type", "text/plain")
+	w.Write([]byte("cache reload message sent"))
 }
