@@ -8,7 +8,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"strings"
 	"text/template"
 	"time"
 
@@ -23,14 +22,13 @@ var (
 	airtableBase = flag.String("airtable-base", "app6dzsa26hDjI7tp", "base ID for airtable store")
 	airtableKey  = os.Getenv("AIRTABLE_API_KEY")
 	civicKey     = os.Getenv("CIVIC_API_KEY")
-	civicCache   = cache.New(1*time.Hour, 10*time.Minute)
 
 	db         *sql.DB
 	countCache = cache.New(1*time.Hour, 10*time.Minute)
 )
 
-
 var globalIssues IssueLister
+var repFinder RepFinder
 
 var pagetemplate *template.Template
 
@@ -54,6 +52,9 @@ func main() {
 	if gErr != nil {
 		log.Fatalln(gErr)
 	}
+
+	cAPI := NewCivicAPI(civicKey, http.DefaultClient)
+	repFinder = NewRepCache(cAPI, time.Hour, 10*time.Minute)
 
 	// index template... unused
 	p, err := template.ParseFiles("index.html")
@@ -92,45 +93,14 @@ func pageHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	zip := vars["zip"]
 
-	localContacts := []Contact{}
+	var localReps *LocalReps
+	var err error
 
 	if len(zip) == 5 && zip != "" {
 		log.Printf("zip %s", zip)
-
-		googResponse, err := getReps(zip)
+		localReps, _, err = repFinder.GetReps(zip)
 		if err != nil {
-			panic(err)
-		}
-
-		// remove president and vice president from officials
-		validOfficials := []GoogleOfficial{}
-		for _, office := range googResponse.Offices {
-			if strings.Contains(office.Name, "President") {
-				continue
-			}
-
-			for _, index := range office.OfficialIndices {
-				official := googResponse.Officials[index]
-
-				if strings.Contains(office.Name, "Senate") {
-					official.Area = "Senate"
-				} else if strings.Contains(office.Name, "House") {
-					official.Area = "House"
-				} else {
-					official.Area = "Other"
-				}
-
-				validOfficials = append(validOfficials, official)
-			}
-		}
-
-		for _, rep := range validOfficials {
-			localContacts = append(localContacts, Contact{
-				Name:     rep.Name,
-				Phone:    rep.Phones[0],
-				PhotoURL: rep.PhotoURL,
-				Area:     rep.Area,
-			})
+			log.Println("Unable to find local reps for", zip, err)
 		}
 	} else {
 		log.Printf("no zip")
@@ -144,30 +114,25 @@ func pageHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for _, issue := range all {
-		addContacts := false
 		newContacts := []Contact{}
-
 		for _, contact := range issue.Contacts {
 			if contact.Name == "LOCAL REP" {
-				addContacts = true
+				if localReps != nil {
+					if localReps.HouseRep != nil {
+						c := *localReps.HouseRep
+						c.Reason = "This is your local representative in the house"
+						newContacts = append(newContacts, c)
+					}
+					for _, s := range localReps.Senators {
+						c := *s
+						c.Reason = "This is one of your two senators"
+						newContacts = append(newContacts, c)
+					}
+				}
 			} else {
 				newContacts = append(newContacts, contact)
 			}
 		}
-
-		if addContacts {
-			// add the local contacts loaded from google civic
-			for _, contact := range localContacts {
-				if contact.Area == "Senate" {
-					contact.Reason = "This is one of your two Senators"
-				} else if contact.Area == "House" {
-					contact.Reason = "This is your local representative in the House"
-				}
-
-				newContacts = append(newContacts, contact)
-			}
-		}
-
 		issue.Contacts = newContacts
 		customizedIssues = append(customizedIssues, issue)
 	}

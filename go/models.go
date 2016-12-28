@@ -25,3 +25,19 @@ type Contact struct {
 func (c *Contact) String() string {
 	return asJson(c)
 }
+
+// LocalReps are the contacts that constitute local representatives
+// for a supplied address.
+type LocalReps struct {
+	HouseRep *Contact   // house representative
+	Senators []*Contact // senators
+}
+
+// Address is a US address. It has the same structure as the normalized
+// address returned by the civic API.
+type Address struct {
+	Line1 string
+	City  string
+	State string
+	Zip   string
+}
