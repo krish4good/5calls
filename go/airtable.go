@@ -35,7 +35,7 @@ type atIssueInfo struct {
 	Name         string   `json:"Name"`
 	Action       string   `json:"Action requested"`
 	Script       string   `json:"Script"`
-	ContactLinks []string `json:"contact"`
+	ContactLinks []string `json:"Contact"`
 }
 
 // atIssue is an airtable issue record.

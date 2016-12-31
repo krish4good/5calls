@@ -42,7 +42,9 @@ func (ae *APIError) Error() string {
 	var buf bytes.Buffer
 	fmt.Fprintf(&buf, "%d %s", ae.Code, ae.Message)
 	for _, e := range ae.Errors {
-		fmt.Fprintf(&buf, ";[domain=%s, reason=%s: %s]", e.Domain, e.Reason, e.Message)
+		if e.Message != ae.Message { // don't duplicate messages
+			fmt.Fprintf(&buf, ";[domain=%s, reason=%s: %s]", e.Domain, e.Reason, e.Message)
+		}
 	}
 	return buf.String()
 }
